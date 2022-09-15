@@ -24,6 +24,12 @@ if(NOT ANDROID)
     set(HAVE_SPECIAL OFF CACHE BOOL "Build special" FORCE)
   endif()
 
+  if (CMAKE_BUILD_TYPE MATCHES "Debug")
+    set(LIBS "-lgflags_nothreads_debug -lglogd -lpthread")
+  else()
+    set(LIBS "-lgflags_nothreads -lglog -lpthread")
+  endif()
+
   # The original openfst uses GNU Build System to run configure and build.
   # So, we use "OpenFST port for Windows" to build openfst with cmake in Windows.
   # Openfst is compiled with glog/gflags to avoid log and flag conflicts with log and flags in wenet/libtorch.
@@ -41,9 +47,9 @@ if(NOT ANDROID)
       CONFIGURE_COMMAND ${openfst_SOURCE_DIR}/configure ${CONFIG_FLAGS} --prefix=${openfst_PREFIX_DIR}
                           "CPPFLAGS=-I${gflags_BINARY_DIR}/include -I${glog_SOURCE_DIR}/src -I${glog_BINARY_DIR} ${TORCH_CXX_FLAGS}"
                           "LDFLAGS=-L${gflags_BINARY_DIR} -L${glog_BINARY_DIR}"
-                          "LIBS=-lgflags_nothreads -lglog -lpthread"
+                          "LIBS=${LIBS}"
       COMMAND           ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/patch/openfst ${openfst_SOURCE_DIR}
-      BUILD_COMMAND     make -j$(nproc)
+      BUILD_COMMAND     make
     )
     add_dependencies(openfst gflags glog)
     link_directories(${openfst_PREFIX_DIR}/lib)

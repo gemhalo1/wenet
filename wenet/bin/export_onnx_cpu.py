@@ -33,6 +33,9 @@ except ImportError:
     print('Please install onnx and onnxruntime!')
     sys.exit(1)
 
+from io import BytesIO
+from onnx import shape_inference
+import onnxoptimizer
 
 def get_args():
     parser = argparse.ArgumentParser(description='export your script model')
@@ -45,6 +48,8 @@ def get_args():
                         type=int, help='cache chunks')
     parser.add_argument('--reverse_weight', default=0.5,
                         type=float, help='reverse_weight in attention_rescoing')
+    parser.add_argument('--no_offset', action='store_true', help='feed pos_emb instead of offset')
+    parser.add_argument('--fixed', action='store_true', help='output fixed tensor shape')
     args = parser.parse_args()
     return args
 
@@ -141,24 +146,45 @@ def export_encoder(asr_model, args):
     #   to avoid padding the last chunk (which usually contains less
     #   frames than required). For users who want static axes, just pop
     #   out specific axis.
-    # if args['chunk_size'] > 0:  # 16/4, 16/-1, 16/0
-    #     dynamic_axes.pop('chunk')
-    #     dynamic_axes.pop('output')
-    # if args['left_chunks'] >= 0:  # 16/4, 16/0
-    #     # NOTE(xsong): since we feed real cache & real mask into the
-    #     #   model when left_chunks > 0, the shape of cache will never
-    #     #   be changed.
-    #     dynamic_axes.pop('att_cache')
-    #     dynamic_axes.pop('r_att_cache')
-    torch.onnx.export(
-        encoder, inputs, encoder_outpath, opset_version=13,
-        export_params=True, do_constant_folding=True,
-        input_names=[
-            'chunk', 'offset', 'required_cache_size',
-            'att_cache', 'cnn_cache', 'att_mask'
-        ],
-        output_names=['output', 'r_att_cache', 'r_cnn_cache'],
-        dynamic_axes=dynamic_axes, verbose=False)
+    if args['fixed']:
+        if args['chunk_size'] > 0:  # 16/4, 16/-1, 16/0
+            dynamic_axes.pop('chunk')
+            dynamic_axes.pop('output')
+        if args['left_chunks'] >= 0:  # 16/4, 16/0
+            # NOTE(xsong): since we feed real cache & real mask into the
+            #   model when left_chunks > 0, the shape of cache will never
+            #   be changed.
+            dynamic_axes.pop('att_cache')
+            dynamic_axes.pop('r_att_cache')
+            dynamic_axes.pop('att_mask')
+
+        with BytesIO() as mem_file:
+            torch.onnx.export(
+                encoder, inputs, mem_file, opset_version=13,
+                export_params=True, do_constant_folding=True,
+                input_names=[
+                    'chunk', 'offset', 'required_cache_size',
+                    'att_cache', 'cnn_cache', 'att_mask'
+                ],
+                output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+                dynamic_axes=dynamic_axes, verbose=False)
+
+            onnx_model = shape_inference.infer_shapes(onnx.load_from_string(mem_file.getvalue()),
+                                                      check_type=True, strict_mode=True, data_prop=True)
+            onnx_model = onnxoptimizer.optimize(onnx_model, onnxoptimizer.get_fuse_and_elimination_passes())
+
+            with open(encoder_outpath, mode='wb') as f:
+                f.write(onnx_model.SerializeToString())
+    else:
+        torch.onnx.export(
+            encoder, inputs, encoder_outpath, opset_version=13,
+            export_params=True, do_constant_folding=True,
+            input_names=[
+                'chunk', 'offset', 'required_cache_size',
+                'att_cache', 'cnn_cache', 'att_mask'
+            ],
+            output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+            dynamic_axes=dynamic_axes, verbose=False)
     onnx_encoder = onnx.load(encoder_outpath)
     for (k, v) in args.items():
         meta = onnx_encoder.metadata_props.add()
@@ -239,6 +265,203 @@ def export_encoder(asr_model, args):
     print("\t\tcustom_metadata_map={}".format(meta.custom_metadata_map))
     print("\t\tCheck onnx_encoder, pass!")
 
+
+def export_encoder_no_offset(asr_model, args):
+    print("Stage-1: export encoder")
+    encoder = asr_model.encoder
+    encoder.forward = encoder.forward_chunk_without_offset
+    encoder_outpath = os.path.join(args['output_dir'], 'encoder.onnx')
+
+    print("\tStage-1.1: prepare inputs for encoder")
+    chunk = torch.randn(
+        (args['batch'], args['decoding_window'], args['feature_size']))
+
+    # NOTE(xcsong): The uncertainty of `next_cache_start` only appears
+    #   in the first few chunks, this is caused by dynamic att_cache shape, i,e
+    #   (0, 0, 0, 0) for 1st chunk and (elayers, head, ?, d_k*2) for subsequent
+    #   chunks. One way to ease the ONNX export is to keep `next_cache_start`
+    #   as a fixed value. To do this, for the **first** chunk, if
+    #   left_chunks > 0, we feed real cache & real mask to the model, otherwise
+    #   fake cache & fake mask. In this way, we get:
+    #   1. 16/-1 mode: next_cache_start == 0 for all chunks
+    #   2. 16/4  mode: next_cache_start == chunk_size for all chunks
+    #   3. 16/0  mode: next_cache_start == chunk_size for all chunks
+    #   4. -1/-1 mode: next_cache_start == 0 for all chunks
+    #   NO MORE DYNAMIC CHANGES!!
+    #
+    # NOTE(Mddct): We retain the current design for the convenience of supporting some
+    #   inference frameworks without dynamic shapes. If you're interested in all-in-one
+    #   model that supports different chunks please see:
+    #   https://github.com/wenet-e2e/wenet/pull/1174
+
+    if args['left_chunks'] > 0:  # 16/4
+        required_cache_size = args['chunk_size'] * args['left_chunks']
+        offset = required_cache_size
+        # Real cache
+        att_cache = torch.zeros(
+            (args['num_blocks'], args['head'], required_cache_size,
+             args['output_size'] // args['head'] * 2))
+        pos_emb = torch.randn(args['batch'], args['chunk_size'] + required_cache_size, args['output_size'])
+
+        # Real mask
+        att_mask = torch.ones(
+            (args['batch'], 1, required_cache_size + args['chunk_size']),
+            dtype=torch.bool)
+        att_mask[:, :, :required_cache_size] = 0
+    else:  # 16/-1, -1/-1, 16/0
+        required_cache_size = -1 if args['left_chunks'] < 0 else 0
+        # Fake cache
+        att_cache = torch.zeros(
+            (args['num_blocks'], args['head'], 0,
+             args['output_size'] // args['head'] * 2))
+        pos_emb = torch.randn(args['batch'], args['decoding_window'], args['output_size'])
+        # Fake mask
+        att_mask = torch.ones((0, 0, 0), dtype=torch.bool)
+    cnn_cache = torch.zeros(
+        (args['num_blocks'], args['batch'],
+         args['output_size'], args['cnn_module_kernel'] - 1))
+    inputs = (chunk, pos_emb, required_cache_size,
+              att_cache, cnn_cache, att_mask)
+    print("\t\tchunk.size(): {}\n".format(chunk.size()),
+          "\t\tpos_emb: {}\n".format(pos_emb.size()),
+          "\t\trequired_cache: {}\n".format(required_cache_size),
+          "\t\tatt_cache.size(): {}\n".format(att_cache.size()),
+          "\t\tcnn_cache.size(): {}\n".format(cnn_cache.size()),
+          "\t\tatt_mask.size(): {}\n".format(att_mask.size()))
+
+    print("\tStage-1.2: torch.onnx.export")
+    dynamic_axes = {
+        'chunk': {1: 'T'},
+        'att_cache': {2: 'T_CACHE'},
+        'att_mask': {2: 'T_ADD_T_CACHE'},
+        'output': {1: 'T'},
+        'r_att_cache': {2: 'T_CACHE'},
+    }
+    # NOTE(xcsong): We keep dynamic axes even if in 16/4 mode, this is
+    #   to avoid padding the last chunk (which usually contains less
+    #   frames than required). For users who want static axes, just pop
+    #   out specific axis.
+    if args['fixed']:
+        if args['chunk_size'] > 0:  # 16/4, 16/-1, 16/0
+            dynamic_axes.pop('chunk')
+            dynamic_axes.pop('output')
+        if args['left_chunks'] >= 0:  # 16/4, 16/0
+            # NOTE(xsong): since we feed real cache & real mask into the
+            #   model when left_chunks > 0, the shape of cache will never
+            #   be changed.
+            dynamic_axes.pop('att_cache')
+            dynamic_axes.pop('r_att_cache')
+            dynamic_axes.pop('att_mask')
+
+        with BytesIO() as mem_file:
+            torch.onnx.export(
+                encoder, inputs, mem_file, opset_version=13,
+                export_params=True, do_constant_folding=True,
+                input_names=[
+                    'chunk', 'pos_emb', 'required_cache_size',
+                    'att_cache', 'cnn_cache', 'att_mask'
+                ],
+                output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+                dynamic_axes=dynamic_axes, verbose=False)
+
+            onnx_model = shape_inference.infer_shapes(onnx.load_from_string(mem_file.getvalue()),
+                                                      check_type=True, strict_mode=True, data_prop=True)
+            onnx_model = onnxoptimizer.optimize(onnx_model, onnxoptimizer.get_fuse_and_elimination_passes())
+
+            with open(encoder_outpath, mode='wb') as f:
+                f.write(onnx_model.SerializeToString())
+    else:
+        torch.onnx.export(
+            encoder, inputs, encoder_outpath, opset_version=13,
+            export_params=True, do_constant_folding=True,
+            input_names=[
+                'chunk', 'pos_emb', 'required_cache_size',
+                'att_cache', 'cnn_cache', 'att_mask'
+            ],
+            output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+            dynamic_axes=dynamic_axes, verbose=False)
+    onnx_encoder = onnx.load(encoder_outpath)
+    for (k, v) in args.items():
+        meta = onnx_encoder.metadata_props.add()
+        meta.key, meta.value = str(k), str(v)
+    onnx.checker.check_model(onnx_encoder)
+    onnx.helper.printable_graph(onnx_encoder.graph)
+    # NOTE(xcsong): to add those metadatas we need to reopen
+    #   the file and resave it.
+    onnx.save(onnx_encoder, encoder_outpath)
+    print_input_output_info(onnx_encoder, "onnx_encoder")
+    print('\t\tExport onnx_encoder, done! see {}'.format(encoder_outpath))
+
+    print("\tStage-1.3: check onnx_encoder and torch_encoder")
+    torch_output = []
+    torch_chunk = copy.deepcopy(chunk)
+    torch_pos_emb = copy.deepcopy(pos_emb)
+    torch_required_cache_size = copy.deepcopy(required_cache_size)
+    torch_att_cache = copy.deepcopy(att_cache)
+    torch_cnn_cache = copy.deepcopy(cnn_cache)
+    torch_att_mask = copy.deepcopy(att_mask)
+    for i in range(10):
+        print("\t\ttorch chunk-{}: {}, pos_emb: {}, att_cache: {},"
+              " cnn_cache: {}, att_mask: {}".format(
+            i, list(torch_chunk.size()), torch_pos_emb,
+            list(torch_att_cache.size()),
+            list(torch_cnn_cache.size()), list(torch_att_mask.size())))
+        # NOTE(xsong): att_mask of the first few batches need changes if
+        #   we use 16/4 mode.
+        if args['left_chunks'] > 0:  # 16/4
+            torch_att_mask[:, :, -(args['chunk_size'] * (i + 1)):] = 1
+        out, torch_att_cache, torch_cnn_cache = encoder(
+            torch_chunk, torch_pos_emb, torch_required_cache_size,
+            torch_att_cache, torch_cnn_cache, torch_att_mask)
+        torch_output.append(out)
+        # torch_offset += out.size(1)
+    torch_output = torch.cat(torch_output, dim=1)
+
+    onnx_output = []
+    onnx_chunk = to_numpy(chunk)
+    onnx_pos_emb = to_numpy(pos_emb)
+    onnx_required_cache_size = np.array((required_cache_size)).astype(np.int64)
+    onnx_att_cache = to_numpy(att_cache)
+    onnx_cnn_cache = to_numpy(cnn_cache)
+    onnx_att_mask = to_numpy(att_mask)
+    ort_session = onnxruntime.InferenceSession(encoder_outpath)
+    input_names = [node.name for node in onnx_encoder.graph.input]
+    print('====>', input_names)
+    for i in range(10):
+        print("\t\tonnx  chunk-{}: {}, pos_emb: {}, att_cache: {},"
+              " cnn_cache: {}, att_mask: {}".format(
+            i, onnx_chunk.shape, onnx_pos_emb.shape, onnx_att_cache.shape,
+            onnx_cnn_cache.shape, onnx_att_mask.shape))
+        # NOTE(xsong): att_mask of the first few batches need changes if
+        #   we use 16/4 mode.
+        if args['left_chunks'] > 0:  # 16/4
+            onnx_att_mask[:, :, -(args['chunk_size'] * (i + 1)):] = 1
+        ort_inputs = {
+            'chunk': onnx_chunk,
+            'pos_emb': onnx_pos_emb,
+            'required_cache_size': onnx_required_cache_size,
+            'att_cache': onnx_att_cache,
+            'cnn_cache': onnx_cnn_cache,
+            'att_mask': onnx_att_mask
+        }
+        # NOTE(xcsong): If we use 16/-1, -1/-1 or 16/0 mode, `next_cache_start`
+        #   will be hardcoded to 0 or chunk_size by ONNX, thus
+        #   required_cache_size and att_mask are no more needed and they will
+        #   be removed by ONNX automatically.
+        for k in list(ort_inputs):
+            if k not in input_names:
+                ort_inputs.pop(k)
+        ort_outs = ort_session.run(None, ort_inputs)
+        onnx_att_cache, onnx_cnn_cache = ort_outs[1], ort_outs[2]
+        onnx_output.append(ort_outs[0])
+        # onnx_offset += ort_outs[0].shape[1]
+    onnx_output = np.concatenate(onnx_output, axis=1)
+
+    np.testing.assert_allclose(to_numpy(torch_output), onnx_output,
+                               rtol=1e-03, atol=1e-05)
+    meta = ort_session.get_modelmeta()
+    print("\t\tcustom_metadata_map={}".format(meta.custom_metadata_map))
+    print("\t\tCheck onnx_encoder, pass!")
 
 def export_ctc(asr_model, args):
     print("Stage-2: export ctc")
@@ -381,6 +604,7 @@ def main():
     arguments['eos_symbol'] = model.eos_symbol()
     arguments['is_bidirectional_decoder'] = 1 \
         if model.is_bidirectional_decoder() else 0
+    arguments['fixed'] = args.fixed
 
     # NOTE(xcsong): Please note that -1/-1 means non-streaming model! It is
     #   not a [16/4 16/-1 16/0] all-in-one model and it should not be used in
@@ -390,7 +614,10 @@ def main():
     if arguments['left_chunks'] > 0:
         assert arguments['chunk_size'] > 0  # -1/4 not supported
 
-    export_encoder(model, arguments)
+    if args.no_offset:
+        export_encoder_no_offset(model, arguments)
+    else:
+        export_encoder(model, arguments)
     export_ctc(model, arguments)
     export_decoder(model, arguments)
 

@@ -26,10 +26,14 @@
 #ifdef USE_ONNX
 #include "decoder/onnx_asr_model.h"
 #endif
+#ifdef USE_MNN
+#include "decoder/mnn_asr_model.h"
+#endif
 #ifdef USE_TORCH
 #include "decoder/torch_asr_model.h"
 #endif
 #include "frontend/feature_pipeline.h"
+#include "mnn_asr_model.h"
 #include "post_processor/post_processor.h"
 #include "utils/flags.h"
 #include "utils/string.h"
@@ -40,6 +44,8 @@ DEFINE_int32(num_threads, 1, "num threads for ASR model");
 DEFINE_string(model_path, "", "pytorch exported model path");
 // OnnxAsrModel flags
 DEFINE_string(onnx_dir, "", "directory where the onnx model is saved");
+// MnnAsrModel flags
+DEFINE_string(mnn_dir, "", "directory where the MNN model is saved");
 
 // FeaturePipelineConfig flags
 DEFINE_int32(num_bins, 80, "num mel bins for fbank feature");
@@ -130,7 +136,18 @@ std::shared_ptr<DecodeResource> InitDecodeResourceFromFlags() {
 #else
     LOG(FATAL) << "Please rebuild with cmake options '-DONNX=ON'.";
 #endif
-  } else {
+  }
+  else if(!FLAGS_mnn_dir.empty()) {
+#ifdef USE_MNN
+    LOG(INFO) << "Reading MNN model ";
+    auto model = std::make_shared<MnnAsrModel>();
+    model->Read(FLAGS_mnn_dir);
+    resource->model = model;
+#else
+    LOG(FATAL) << "Please rebuild with cmake options '-DMNN=ON'.";
+#endif
+  }
+  else {
 #ifdef USE_TORCH
     LOG(INFO) << "Reading torch model " << FLAGS_model_path;
     TorchAsrModel::InitEngineThreads(FLAGS_num_threads);
