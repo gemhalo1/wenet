@@ -15,7 +15,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 #include "decoder/mnn_asr_model.h"
 
 #include <algorithm>
@@ -73,14 +72,30 @@ void MnnAsrModel::GetInputOutputInfo(
     auto& tensor = x.second;
 
     auto node_dims = tensor->shape();
+    halide_type_t type = tensor->getType();
+    MNN::Tensor::DimensionType dimType = tensor->getDimensionType();
+
+    std::vector<int> strides;
+    for(int i = 0; i < node_dims.size(); i++)
+      strides.push_back(tensor->stride(i));
 
     std::stringstream shape;
     for (auto j : node_dims) {
       shape << j;
       shape << " ";
     }
-    LOG(INFO) << "\tInput " << in_names->size() << " : name=" << name << " type=" << "?"
-              << " dims=" << shape.str();
+
+    std::stringstream strides_s;
+    for (auto j : strides) {
+      strides_s << j;
+      strides_s << " ";
+    }
+
+    LOG(INFO) << "\tInput " << in_names->size() << " : name=" << name << " type=" << type.code
+              << " dimention-type=" << dimType
+              << " dims=" << shape.str()
+              << " stides=" << strides_s.str();
+        ;
     in_names->push_back(name.c_str());
   }
 
@@ -93,13 +108,16 @@ void MnnAsrModel::GetInputOutputInfo(
     auto& tensor = x.second;
 
     auto node_dims = tensor->shape();
+    halide_type_t type = tensor->getType();
+    MNN::Tensor::DimensionType dimType = tensor->getDimensionType();
 
     std::stringstream shape;
     for (auto j : node_dims) {
       shape << j;
       shape << " ";
     }
-    LOG(INFO) << "\tOutput " << out_names->size() << " : name=" << name << " type=" << "?"
+    LOG(INFO) << "\tOutput " << out_names->size() << " : name=" << name << " type=" << type.code
+              << " dimention-type=" << dimType
               << " dims=" << shape.str();
     out_names->push_back(name.c_str());
   }
@@ -124,9 +142,10 @@ json::value read_json( std::istream& is, json::error_code& ec )
 
 void MnnAsrModel::Read(const std::string& model_dir) {
   std::string encoder_mnn_path = model_dir + "/encoder.mnn";
-  std::string rescore_mnn_path = model_dir + "/decoder.mnn";
+  std::string rescore_mnn_path = model_dir + "/decoder_s.mnn";
   std::string ctc_mnn_path = model_dir + "/ctc.mnn";
   std::string meta_mnn_path = model_dir + "/meta.json";
+  std::string pos_mnn_path = model_dir + "/pos_emb.bin";
 
   // 1. Load sessions
   try {
@@ -153,30 +172,30 @@ void MnnAsrModel::Read(const std::string& model_dir) {
   }
 
   // 2. Read metadata
-    std::ifstream meta_stream;
-    meta_stream.open(meta_mnn_path.c_str(), std::ios::in);
-    if(meta_stream.is_open()) {
-      json::error_code ec;
-      json::value value = read_json(meta_stream, ec);
+  std::ifstream meta_stream;
+  meta_stream.open(meta_mnn_path.c_str(), std::ios::in);
+  if(meta_stream.is_open()) {
+    json::error_code ec;
+    json::value value = read_json(meta_stream, ec);
 
-      if(value.is_object()) {
-        json::object obj = value.as_object();
+    if(value.is_object()) {
+      json::object obj = value.as_object();
 
 #define CONVERT_INT_FIELD(f) atoi(obj[f].as_string().c_str())
-        encoder_output_size_ = CONVERT_INT_FIELD("output_size");
-        num_blocks_ = CONVERT_INT_FIELD("num_blocks");
-        head_ = CONVERT_INT_FIELD("head");
-        cnn_module_kernel_ = CONVERT_INT_FIELD("cnn_module_kernel");
-        subsampling_rate_ = CONVERT_INT_FIELD("subsampling_rate");
-        right_context_ = CONVERT_INT_FIELD("right_context");
-        sos_ = CONVERT_INT_FIELD("sos_symbol");
-        eos_ = CONVERT_INT_FIELD("eos_symbol");
-        is_bidirectional_decoder_ = CONVERT_INT_FIELD("is_bidirectional_decoder");
-        chunk_size_ = CONVERT_INT_FIELD("chunk_size");
-        num_left_chunks_ = CONVERT_INT_FIELD("left_chunks");
-      }
+      encoder_output_size_ = CONVERT_INT_FIELD("output_size");
+      num_blocks_ = CONVERT_INT_FIELD("num_blocks");
+      head_ = CONVERT_INT_FIELD("head");
+      cnn_module_kernel_ = CONVERT_INT_FIELD("cnn_module_kernel");
+      subsampling_rate_ = CONVERT_INT_FIELD("subsampling_rate");
+      right_context_ = CONVERT_INT_FIELD("right_context");
+      sos_ = CONVERT_INT_FIELD("sos_symbol");
+      eos_ = CONVERT_INT_FIELD("eos_symbol");
+      is_bidirectional_decoder_ = CONVERT_INT_FIELD("is_bidirectional_decoder");
+      chunk_size_ = CONVERT_INT_FIELD("chunk_size");
+      num_left_chunks_ = CONVERT_INT_FIELD("left_chunks");
+      deocding_window_ = CONVERT_INT_FIELD("decoding_window");
     }
-
+  }
 
   LOG(INFO) << "Mnn Model Info:";
   LOG(INFO) << "\tencoder_output_size " << encoder_output_size_;
@@ -214,6 +233,7 @@ MnnAsrModel::MnnAsrModel(const MnnAsrModel& other) {
   chunk_size_ = other.chunk_size_;
   num_left_chunks_ = other.num_left_chunks_;
   offset_ = other.offset_;
+  deocding_window_ = other.deocding_window_;
 
   // interpreter
   encoder_interpreter_ = other.encoder_interpreter_;
@@ -224,6 +244,17 @@ MnnAsrModel::MnnAsrModel(const MnnAsrModel& other) {
   encoder_session_ = std::make_shared<MnnSession>(encoder_interpreter_, scheduleConfig);
   rescore_session_ = std::make_shared<MnnSession>(rescore_interpreter_, scheduleConfig);
   ctc_session_ = std::make_shared<MnnSession>(ctc_interpreter_, scheduleConfig);
+
+  {
+    auto t = encoder_session_->getSessionInput("chunk");
+    auto x =  t->getDimensionType();
+    local_feats_tensor_ =
+        std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+
+    t = encoder_session_->getSessionInput("att_mask");
+    local_att_mask_tensor_ =
+        std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+  }
 
   // node names
   encoder_in_names_ = other.encoder_in_names_;
@@ -266,6 +297,8 @@ void MnnAsrModel::Reset() {
 
     MNN::Tensor* t = encoder_session_->getSessionInput("att_cache");
     encoder_interpreter_->resizeTensor(t, att_cache_shape);
+    auto* buffer = t->host<float>();
+    std::fill(buffer, buffer + t->elementSize(), 0.0f);
   }
 
   // Reset cnn_cache
@@ -282,38 +315,54 @@ void MnnAsrModel::Reset() {
   }
 }
 
+bool MnnSession::resizeTensor(MNN::Tensor* tensor, const std::vector<int>& shape) {
+  std::vector<int> currentShape = tensor->shape();
+
+  if(shape != currentShape) {
+    interpreter_->resizeTensor(tensor, shape);
+    return true;
+  }
+  return false;
+}
+
+void MnnSession::resizeSession() {
+  interpreter_->resizeSession(session_);
+}
+
+void MnnSession::runSession() {
+  interpreter_->runSession(session_);
+}
+
 void MnnAsrModel::ForwardEncoderFunc(
     const std::vector<std::vector<float>>& chunk_feats,
     std::vector<std::vector<float>>* out_prob) {
-#if 0
-  Ort::MemoryInfo memory_info =
-      Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+
   // 1. Prepare onnx required data, splice cached_feature_ and chunk_feats
   // chunk
   int num_frames = cached_feature_.size() + chunk_feats.size();
   const int feature_dim = chunk_feats[0].size();
-  std::vector<float> feats;
+  feats_.resize(0);
   for (size_t i = 0; i < cached_feature_.size(); ++i) {
-    feats.insert(feats.end(), cached_feature_[i].begin(),
+    feats_.insert(feats_.end(), cached_feature_[i].begin(),
                  cached_feature_[i].end());
   }
   for (size_t i = 0; i < chunk_feats.size(); ++i) {
-    feats.insert(feats.end(), chunk_feats[i].begin(), chunk_feats[i].end());
+    feats_.insert(feats_.end(), chunk_feats[i].begin(), chunk_feats[i].end());
   }
-  const int64_t feats_shape[3] = {1, num_frames, feature_dim};
-  Ort::Value feats_ort = Ort::Value::CreateTensor<float>(
-      memory_info, feats.data(), feats.size(), feats_shape, 3);
-  // offset
-  int64_t offset_int64 = static_cast<int64_t>(offset_);
-  Ort::Value offset_ort = Ort::Value::CreateTensor<int64_t>(
-      memory_info, &offset_int64, 1, std::vector<int64_t>{}.data(), 0);
+  feats_.resize(deocding_window_ * feature_dim);
+  std::copy(feats_.begin(), feats_.end(), local_feats_tensor_->host<float>());
+
+  MNN::Tensor* chunk_tensor = encoder_session_->getSessionInput("chunk");
+  chunk_tensor->copyFromHostTensor(local_feats_tensor_.get());
+
+  // calculate the size of input after downsampling
+  int real_chunk_size = num_frames / subsampling_rate_;
+
   // required_cache_size
-  int64_t required_cache_size = chunk_size_ * num_left_chunks_;
-  Ort::Value required_cache_size_ort = Ort::Value::CreateTensor<int64_t>(
-      memory_info, &required_cache_size, 1, std::vector<int64_t>{}.data(), 0);
+  int required_cache_size = chunk_size_ * num_left_chunks_;
+
   // att_mask
-  Ort::Value att_mask_ort{nullptr};
-  std::vector<uint8_t> att_mask(required_cache_size + chunk_size_, 1);
+  std::vector<int32_t> att_mask(required_cache_size + chunk_size_, 1);
   if (num_left_chunks_ > 0) {
     int chunk_idx = offset_ / chunk_size_ - num_left_chunks_;
     if (chunk_idx < num_left_chunks_) {
@@ -321,59 +370,62 @@ void MnnAsrModel::ForwardEncoderFunc(
         att_mask[i] = 0;
       }
     }
-    const int64_t att_mask_shape[] = {1, 1, required_cache_size + chunk_size_};
-    att_mask_ort = Ort::Value::CreateTensor<bool>(
-        memory_info, reinterpret_cast<bool*>(att_mask.data()), att_mask.size(),
-        att_mask_shape, 3);
+//    std::vector<int> att_mask_shape = {1, 1, required_cache_size + chunk_size_};
+//    resized = encoder_session_->resizeTensor(att_mask_tensor, att_mask_shape) || resized;
   }
+  for(int i = real_chunk_size; i < chunk_size_; i++) {
+    att_mask[required_cache_size + i] = 0;
+  }
+  std::copy(att_mask.begin(), att_mask.end(), local_att_mask_tensor_->host<int32_t>());
+  MNN::Tensor* att_mask_tensor = encoder_session_->getSessionInput("att_mask");
+  att_mask_tensor->copyFromHostTensor(local_att_mask_tensor_.get());
+
+  //pos_emb
+  //TODO: provide pos_emb data
+  //TODO: !!!!!!! dim 1 must be resized for last chunk
+  MNN::Tensor* pos_emb_tensor = encoder_session_->getSessionInput("pos_emb");
+  {
+    float* p = pos_emb_tensor->host<float>();
+    std::fill(p, p + pos_emb_tensor->elementSize(), 0.0f);
+  }
+
+//  std::vector<int> pos_emb_shape = {1, required_cache_size + real_chunk_size, encoder_output_size_};
+//  resized = encoder_session_->resizeTensor(pos_emb_tensor, pos_emb_shape) || resized;
 
   // 2. Encoder chunk forward
-  std::vector<Ort::Value> inputs;
-  for (auto name : encoder_in_names_) {
-    if (!strcmp(name, "chunk")) {
-      inputs.emplace_back(std::move(feats_ort));
-    } else if (!strcmp(name, "offset")) {
-      inputs.emplace_back(std::move(offset_ort));
-    } else if (!strcmp(name, "required_cache_size")) {
-      inputs.emplace_back(std::move(required_cache_size_ort));
-    } else if (!strcmp(name, "att_cache")) {
-      inputs.emplace_back(std::move(att_cache_ort_));
-    } else if (!strcmp(name, "cnn_cache")) {
-      inputs.emplace_back(std::move(cnn_cache_ort_));
-    } else if (!strcmp(name, "att_mask")) {
-      inputs.emplace_back(std::move(att_mask_ort));
-    }
-  }
 
-  std::vector<Ort::Value> ort_outputs = encoder_session_->Run(
-      Ort::RunOptions{nullptr}, encoder_in_names_.data(), inputs.data(),
-      inputs.size(), encoder_out_names_.data(), encoder_out_names_.size());
+  encoder_session_->runSession();
 
-  offset_ += static_cast<int>(
-      ort_outputs[0].GetTensorTypeAndShapeInfo().GetShape()[1]);
-  att_cache_ort_ = std::move(ort_outputs[1]);
-  cnn_cache_ort_ = std::move(ort_outputs[2]);
+  MNN::Tensor* output_tensor = encoder_session_->getSessionOutput("output");
+  MNN::Tensor* r_att_cache_tensor = encoder_session_->getSessionOutput("r_att_cache");
+  MNN::Tensor* r_cnn_cache_tensor = encoder_session_->getSessionOutput("r_cnn_cache");
 
-  std::vector<Ort::Value> ctc_inputs;
-  ctc_inputs.emplace_back(std::move(ort_outputs[0]));
+  r_att_cache_tensor->copyToHostTensor(encoder_session_->getSessionInput("att_cache"));
+  r_cnn_cache_tensor->copyToHostTensor(encoder_session_->getSessionInput("cnn_cache"));
 
-  std::vector<Ort::Value> ctc_ort_outputs = ctc_session_->Run(
-      Ort::RunOptions{nullptr}, ctc_in_names_.data(), ctc_inputs.data(),
-      ctc_inputs.size(), ctc_out_names_.data(), ctc_out_names_.size());
-  encoder_outs_.push_back(std::move(ctc_inputs[0]));
+  std::vector<int> output_shape = output_tensor->shape();
 
-  float* logp_data = ctc_ort_outputs[0].GetTensorMutableData<float>();
-  auto type_info = ctc_ort_outputs[0].GetTensorTypeAndShapeInfo();
+  offset_ += (int)output_shape[1];
 
-  int num_outputs = type_info.GetShape()[1];
-  int output_dim = type_info.GetShape()[2];
+  /////////////////////////////////////////////
+  MNN::Tensor* hidden_tensor = ctc_session_->getSessionInput("hidden");
+  hidden_tensor->copyFromHostTensor(output_tensor);
+  ctc_session_->runSession();
+
+  MNN::Tensor* probs_tensor = ctc_session_->getSessionOutput("probs");
+
+  auto* logp_data = probs_tensor->host<float>();
+  std::vector<int> probs_shape = probs_tensor->shape();
+
+//  int num_outputs = probs_shape[1];
+  int num_outputs = real_chunk_size;
+  int output_dim = probs_shape[2];
   out_prob->resize(num_outputs);
   for (int i = 0; i < num_outputs; i++) {
     (*out_prob)[i].resize(output_dim);
     memcpy((*out_prob)[i].data(), logp_data + i * output_dim,
            sizeof(float) * output_dim);
   }
-#endif
 }
 
 float MnnAsrModel::ComputeAttentionScore(const float* prob,

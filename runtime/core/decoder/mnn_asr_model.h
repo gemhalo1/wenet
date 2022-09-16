@@ -33,7 +33,10 @@ namespace wenet {
 
 // a MNN session shall be released from the interpreter, so a wrapper is needed
 // to do it
+class MnnAsrModel;
+
 class MnnSession {
+  friend class MnnAsrModel;
  public:
   MnnSession(std::shared_ptr<MNN::Interpreter> interpreter, const MNN::ScheduleConfig& scheduleConfig);
   ~MnnSession();
@@ -43,6 +46,10 @@ class MnnSession {
 
   const std::map<std::string, MNN::Tensor*>& getSessionInputAll() const;
   const std::map<std::string, MNN::Tensor*>& getSessionOutputAll() const;
+
+  bool resizeTensor(MNN::Tensor* tensor, const std::vector<int>& shape);
+  void resizeSession();
+  void runSession();
  private:
   std::shared_ptr<MNN::Interpreter> interpreter_;
   MNN::Session* session_ = nullptr;
@@ -74,6 +81,7 @@ class MnnAsrModel : public AsrModel {
   int num_blocks_ = 0;
   int cnn_module_kernel_ = 0;
   int head_ = 0;
+  int deocding_window_ = 67;
 
   static MNN::ScheduleConfig scheduleConfig;
 
@@ -85,6 +93,11 @@ class MnnAsrModel : public AsrModel {
   std::shared_ptr<MnnSession> encoder_session_ = nullptr;
   std::shared_ptr<MnnSession> rescore_session_ = nullptr;
   std::shared_ptr<MnnSession> ctc_session_ = nullptr;
+
+  std::vector<float> feats_;
+  std::unique_ptr<MNN::Tensor> local_feats_tensor_;
+  std::unique_ptr<MNN::Tensor> local_att_mask_tensor_;
+  std::unique_ptr<MNN::Tensor> local_pos_emb_tensor_;
 
   // node names
   std::vector<const char*> encoder_in_names_, encoder_out_names_;
