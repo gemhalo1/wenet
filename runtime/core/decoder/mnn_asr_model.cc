@@ -95,7 +95,7 @@ void MnnAsrModel::GetInputOutputInfo(
               << " dimention-type=" << dimType
               << " dims=" << shape.str()
               << " stides=" << strides_s.str();
-        ;
+    ;
     in_names->push_back(name.c_str());
   }
 
@@ -197,6 +197,16 @@ void MnnAsrModel::Read(const std::string& model_dir) {
     }
   }
 
+  // 3. Read positional embedding data
+  std::ifstream posemb_stream(pos_mnn_path, std::ios::binary | std::ios::in);
+  if(posemb_stream) {
+    posemb_stream.seekg(0, std::ios::end);
+    size_t length = posemb_stream.tellg();
+    pos_emb_table_ = std::make_shared<std::vector<float>>(length / sizeof(float));
+    posemb_stream.seekg(0, std::ios::beg);
+    posemb_stream.read((char*)pos_emb_table_->data(), length);
+  }
+
   LOG(INFO) << "Mnn Model Info:";
   LOG(INFO) << "\tencoder_output_size " << encoder_output_size_;
   LOG(INFO) << "\tnum_blocks " << num_blocks_;
@@ -254,7 +264,13 @@ MnnAsrModel::MnnAsrModel(const MnnAsrModel& other) {
     t = encoder_session_->getSessionInput("att_mask");
     local_att_mask_tensor_ =
         std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+
+    t = encoder_session_->getSessionInput("pos_emb");
+    local_pos_emb_tensor_ =
+        std::make_unique<MNN::Tensor>(t, t->getDimensionType());
   }
+
+  pos_emb_table_ = other.pos_emb_table_;
 
   // node names
   encoder_in_names_ = other.encoder_in_names_;
@@ -274,12 +290,13 @@ std::shared_ptr<AsrModel> MnnAsrModel::Copy() const {
 
 void MnnAsrModel::Reset() {
   offset_ = 0;
-//  encoder_outs_.clear();
+  //  encoder_outs_.clear();
   cached_feature_.clear();
 
   // Reset att_cache
   if (num_left_chunks_ > 0) {
     int required_cache_size = chunk_size_ * num_left_chunks_;
+
     offset_ = required_cache_size;
 
     std::vector<int> att_cache_shape  = {num_blocks_, head_, required_cache_size,
@@ -344,7 +361,7 @@ void MnnAsrModel::ForwardEncoderFunc(
   feats_.resize(0);
   for (size_t i = 0; i < cached_feature_.size(); ++i) {
     feats_.insert(feats_.end(), cached_feature_[i].begin(),
-                 cached_feature_[i].end());
+                  cached_feature_[i].end());
   }
   for (size_t i = 0; i < chunk_feats.size(); ++i) {
     feats_.insert(feats_.end(), chunk_feats[i].begin(), chunk_feats[i].end());
@@ -362,7 +379,7 @@ void MnnAsrModel::ForwardEncoderFunc(
   int required_cache_size = chunk_size_ * num_left_chunks_;
 
   // att_mask
-  std::vector<int32_t> att_mask(required_cache_size + chunk_size_, 1);
+  std::vector<int32_t> att_mask(required_cache_size + chunk_size_);
   if (num_left_chunks_ > 0) {
     int chunk_idx = offset_ / chunk_size_ - num_left_chunks_;
     if (chunk_idx < num_left_chunks_) {
@@ -370,8 +387,6 @@ void MnnAsrModel::ForwardEncoderFunc(
         att_mask[i] = 0;
       }
     }
-//    std::vector<int> att_mask_shape = {1, 1, required_cache_size + chunk_size_};
-//    resized = encoder_session_->resizeTensor(att_mask_tensor, att_mask_shape) || resized;
   }
   for(int i = real_chunk_size; i < chunk_size_; i++) {
     att_mask[required_cache_size + i] = 0;
@@ -381,16 +396,14 @@ void MnnAsrModel::ForwardEncoderFunc(
   att_mask_tensor->copyFromHostTensor(local_att_mask_tensor_.get());
 
   //pos_emb
-  //TODO: provide pos_emb data
-  //TODO: !!!!!!! dim 1 must be resized for last chunk
   MNN::Tensor* pos_emb_tensor = encoder_session_->getSessionInput("pos_emb");
   {
-    float* p = pos_emb_tensor->host<float>();
-    std::fill(p, p + pos_emb_tensor->elementSize(), 0.0f);
-  }
+    int emb_start = (offset_ - required_cache_size) * encoder_output_size_;
+    int emb_end = emb_start + (required_cache_size + chunk_size_) * encoder_output_size_;
 
-//  std::vector<int> pos_emb_shape = {1, required_cache_size + real_chunk_size, encoder_output_size_};
-//  resized = encoder_session_->resizeTensor(pos_emb_tensor, pos_emb_shape) || resized;
+    std::copy(pos_emb_table_->begin() + emb_start,  pos_emb_table_->begin() + emb_end, local_pos_emb_tensor_->host<float>());
+    pos_emb_tensor->copyFromHostTensor(local_pos_emb_tensor_.get());
+  }
 
   // 2. Encoder chunk forward
 
@@ -417,7 +430,7 @@ void MnnAsrModel::ForwardEncoderFunc(
   auto* logp_data = probs_tensor->host<float>();
   std::vector<int> probs_shape = probs_tensor->shape();
 
-//  int num_outputs = probs_shape[1];
+  //  int num_outputs = probs_shape[1];
   int num_outputs = real_chunk_size;
   int output_dim = probs_shape[2];
   out_prob->resize(num_outputs);
@@ -429,8 +442,8 @@ void MnnAsrModel::ForwardEncoderFunc(
 }
 
 float MnnAsrModel::ComputeAttentionScore(const float* prob,
-                                          const std::vector<int>& hyp, int eos,
-                                          int decode_out_len) {
+                                         const std::vector<int>& hyp, int eos,
+                                         int decode_out_len) {
   float score = 0.0f;
 #if 0
   for (size_t j = 0; j < hyp.size(); ++j) {
@@ -442,8 +455,8 @@ float MnnAsrModel::ComputeAttentionScore(const float* prob,
 }
 
 void MnnAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
-                                      float reverse_weight,
-                                      std::vector<float>* rescoring_score) {
+                                     float reverse_weight,
+                                     std::vector<float>* rescoring_score) {
 #if 0
   Ort::MemoryInfo memory_info =
       Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);

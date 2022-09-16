@@ -65,9 +65,6 @@ class MultiHeadedAttention(nn.Module):
 
         """
         n_batch = query.size(0)
-        if type(n_batch) == torch.Tensor:
-            n_batch = n_batch.detach().cpu().item()
-
         q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
         k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
         v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
@@ -97,27 +94,17 @@ class MultiHeadedAttention(nn.Module):
 
         """
         n_batch = value.size(0)
-        if type(n_batch) == torch.Tensor:
-            n_batch = n_batch.detach().cpu().item()
         # NOTE(xcsong): When will `if mask.size(2) > 0` be True?
         #   1. onnx(16/4) [WHY? Because we feed real cache & real mask for the
         #           1st chunk to ease the onnx export.]
         #   2. pytorch training
+        if mask.size(2) > 0 :  # time2 > 0
+            mask = mask.unsqueeze(1)[:, :, :, :scores.size(-1)]
+            r_mask = ~mask  # (batch, 1, *, time2)
 
-        mask_size = mask.size(2)
-        if type(mask_size) == torch.Tensor:
-            mask_size = mask_size.detach().cpu().item()
+            scores = scores * mask + -1000.0 * r_mask
 
-        if mask_size > 0 :  # time2 > 0
-            mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-            # For last chunk, time2 might be larger than scores.size(-1)
-            scores_size = scores.size(-1)
-            if type(scores_size) == torch.Tensor:
-                scores_size = scores_size.detach().cpu().item()
-            mask = mask[:, :, :, :scores_size]  # (batch, 1, *, time2)
-            scores = scores.masked_fill(mask, -float('inf'))
-            attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0)  # (batch, head, time1, time2)
+            attn = torch.softmax(scores, dim=-1) * mask
         # NOTE(xcsong): When will `if mask.size(2) > 0` be False?
         #   1. onnx(16/-1, -1/-1, 16/0)
         #   2. jit (16/-1, -1/-1, 16/0, 16/4)
@@ -298,10 +285,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         new_cache = torch.cat((k, v), dim=-1)
 
         n_batch_pos = pos_emb.size(0)
-        if type(n_batch_pos) == torch.Tensor:
-            n_batch_pos = n_batch_pos.detach().cpu().item()
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
-        #p = self.linear_pos(pos_emb).view(1, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
         # (batch, head, time1, d_k)

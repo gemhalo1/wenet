@@ -66,8 +66,8 @@ class MnnAsrModel : public AsrModel {
                           std::vector<float>* rescoring_score) override;
   std::shared_ptr<AsrModel> Copy() const override;
   static void GetInputOutputInfo(const std::shared_ptr<MnnSession>& session,
-                          std::vector<const char*>* in_names,
-                          std::vector<const char*>* out_names);
+                                 std::vector<const char*>* in_names,
+                                 std::vector<const char*>* out_names);
 
  protected:
   void ForwardEncoderFunc(const std::vector<std::vector<float>>& chunk_feats,
@@ -88,6 +88,8 @@ class MnnAsrModel : public AsrModel {
   std::shared_ptr<MNN::Interpreter> encoder_interpreter_ = nullptr;
   std::shared_ptr<MNN::Interpreter> rescore_interpreter_ = nullptr;
   std::shared_ptr<MNN::Interpreter> ctc_interpreter_ = nullptr;
+
+  std::shared_ptr<std::vector<float>> pos_emb_table_ = nullptr;
 
   // sessions
   std::shared_ptr<MnnSession> encoder_session_ = nullptr;

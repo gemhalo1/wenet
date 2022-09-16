@@ -37,6 +37,17 @@ from io import BytesIO
 from onnx import shape_inference
 import onnxoptimizer
 
+def export_optimized_model(model, inputs, outpath, **kwargs):
+    with BytesIO() as mem_file:
+        torch.onnx.export(model, inputs, mem_file, **kwargs)
+
+        onnx_model = shape_inference.infer_shapes(onnx.load_from_string(mem_file.getvalue()),
+                                                  check_type=True, strict_mode=True, data_prop=True)
+        onnx_model = onnxoptimizer.optimize(onnx_model, onnxoptimizer.get_fuse_and_elimination_passes())
+
+        with open(outpath, mode='wb') as f:
+            f.write(onnx_model.SerializeToString())
+
 def get_args():
     parser = argparse.ArgumentParser(description='export your script model')
     parser.add_argument('--config', required=True, help='config file')
@@ -158,23 +169,15 @@ def export_encoder(asr_model, args):
             dynamic_axes.pop('r_att_cache')
             dynamic_axes.pop('att_mask')
 
-        with BytesIO() as mem_file:
-            torch.onnx.export(
-                encoder, inputs, mem_file, opset_version=13,
-                export_params=True, do_constant_folding=True,
-                input_names=[
-                    'chunk', 'offset', 'required_cache_size',
-                    'att_cache', 'cnn_cache', 'att_mask'
-                ],
-                output_names=['output', 'r_att_cache', 'r_cnn_cache'],
-                dynamic_axes=dynamic_axes, verbose=False)
-
-            onnx_model = shape_inference.infer_shapes(onnx.load_from_string(mem_file.getvalue()),
-                                                      check_type=True, strict_mode=True, data_prop=True)
-            onnx_model = onnxoptimizer.optimize(onnx_model, onnxoptimizer.get_fuse_and_elimination_passes())
-
-            with open(encoder_outpath, mode='wb') as f:
-                f.write(onnx_model.SerializeToString())
+        export_optimized_model(
+            encoder, inputs, encoder_outpath, opset_version=13,
+            export_params=True, do_constant_folding=True,
+            input_names=[
+                'chunk', 'offset', 'required_cache_size',
+                'att_cache', 'cnn_cache', 'att_mask'
+            ],
+            output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+            dynamic_axes=dynamic_axes, verbose=False)
     else:
         torch.onnx.export(
             encoder, inputs, encoder_outpath, opset_version=13,
@@ -272,6 +275,12 @@ def export_encoder_no_offset(asr_model, args):
     encoder.forward = encoder.forward_chunk_without_offset
     encoder_outpath = os.path.join(args['output_dir'], 'encoder.onnx')
 
+    pos_emb_outpath = os.path.join(args['output_dir'], 'pos_emb.bin')
+
+    print("\texport position embedding")
+    pe = asr_model.encoder.embed.pos_enc.pe.detach().cpu().numpy()
+    pe.tofile(pos_emb_outpath)
+
     print("\tStage-1.1: prepare inputs for encoder")
     chunk = torch.randn(
         (args['batch'], args['decoding_window'], args['feature_size']))
@@ -353,23 +362,15 @@ def export_encoder_no_offset(asr_model, args):
             dynamic_axes.pop('r_att_cache')
             dynamic_axes.pop('att_mask')
 
-        with BytesIO() as mem_file:
-            torch.onnx.export(
-                encoder, inputs, mem_file, opset_version=13,
-                export_params=True, do_constant_folding=True,
-                input_names=[
-                    'chunk', 'pos_emb', 'required_cache_size',
-                    'att_cache', 'cnn_cache', 'att_mask'
-                ],
-                output_names=['output', 'r_att_cache', 'r_cnn_cache'],
-                dynamic_axes=dynamic_axes, verbose=False)
-
-            onnx_model = shape_inference.infer_shapes(onnx.load_from_string(mem_file.getvalue()),
-                                                      check_type=True, strict_mode=True, data_prop=True)
-            onnx_model = onnxoptimizer.optimize(onnx_model, onnxoptimizer.get_fuse_and_elimination_passes())
-
-            with open(encoder_outpath, mode='wb') as f:
-                f.write(onnx_model.SerializeToString())
+        export_optimized_model(
+            encoder, inputs, encoder_outpath, opset_version=13,
+            export_params=True, do_constant_folding=True,
+            input_names=[
+                'chunk', 'pos_emb', 'required_cache_size',
+                'att_cache', 'cnn_cache', 'att_mask'
+            ],
+            output_names=['output', 'r_att_cache', 'r_cnn_cache'],
+            dynamic_axes=dynamic_axes, verbose=False)
     else:
         torch.onnx.export(
             encoder, inputs, encoder_outpath, opset_version=13,
@@ -475,8 +476,11 @@ def export_ctc(asr_model, args):
          args['output_size']))
 
     print("\tStage-2.2: torch.onnx.export")
-    dynamic_axes = {'hidden': {1: 'T'}, 'probs': {1: 'T'}}
-    torch.onnx.export(
+    if args['fixed']:
+        dynamic_axes = {}
+    else:
+        dynamic_axes = {'hidden': {1: 'T'}, 'probs': {1: 'T'}}
+    export_optimized_model(
         ctc, hidden, ctc_outpath, opset_version=13,
         export_params=True, do_constant_folding=True,
         input_names=['hidden'], output_names=['probs'],
@@ -518,13 +522,18 @@ def export_decoder(asr_model, args):
     hyps_lens = torch.randint(low=15, high=21, size=[10])
 
     print("\tStage-3.2: torch.onnx.export")
-    dynamic_axes = {
-        'hyps': {0: 'NBEST', 1: 'L'}, 'hyps_lens': {0: 'NBEST'},
-        'encoder_out': {1: 'T'},
-        'score': {0: 'NBEST', 1: 'L'}, 'r_score': {0: 'NBEST', 1: 'L'}
-    }
+
+    if args['fixed']:
+        dynamic_axes = {}
+    else:
+        dynamic_axes = {
+            'hyps': {0: 'NBEST', 1: 'L'}, 'hyps_lens': {0: 'NBEST'},
+            'encoder_out': {1: 'T'},
+            'score': {0: 'NBEST', 1: 'L'}, 'r_score': {0: 'NBEST', 1: 'L'}
+        }
+
     inputs = (hyps, hyps_lens, encoder_out, args['reverse_weight'])
-    torch.onnx.export(
+    export_optimized_model(
         decoder, inputs, decoder_outpath, opset_version=13,
         export_params=True, do_constant_folding=True,
         input_names=['hyps', 'hyps_lens', 'encoder_out', 'reverse_weight'],
@@ -564,6 +573,67 @@ def export_decoder(asr_model, args):
                                    rtol=1e-03, atol=1e-05)
     print("\t\tCheck onnx_decoder, pass!")
 
+def export_decoder_single_uni(asr_model, args):
+    print("Stage-3: export decoder")
+    decoder = asr_model
+    # NOTE(lzhin): parameters of encoder will be automatically removed
+    #   since they are not used during rescoring.
+    decoder.forward = decoder.forward_attention_decoder_single_uni
+    decoder_outpath = os.path.join(args['output_dir'], 'decoder_s.onnx')
+
+    print("\tStage-3.1: prepare inputs for decoder")
+    # hardcode time->200 nbest->10 len->20, they are dynamic axes.
+    encoder_out = torch.randn((1, 200, args['output_size']))
+    hyps = torch.randint(low=0, high=args['vocab_size'],
+                         size=[1, 20])
+    hyps[:, 0] = args['vocab_size'] - 1  # <sos>
+
+    print("\tStage-3.2: torch.onnx.export")
+
+    if args['fixed']:
+        dynamic_axes = {}
+    else:
+        dynamic_axes = {
+            'hyps': {0: 'NBEST', 1: 'L'},
+            'encoder_out': {1: 'T'},
+            'score': {0: 'NBEST', 1: 'L'}
+        }
+
+    inputs = (hyps, encoder_out)
+    export_optimized_model(
+        decoder, inputs, decoder_outpath, opset_version=13,
+        export_params=True, do_constant_folding=True,
+        input_names=['hyps', 'encoder_out'],
+        output_names=['score'],
+        dynamic_axes=dynamic_axes, verbose=False)
+    onnx_decoder = onnx.load(decoder_outpath)
+    for (k, v) in args.items():
+        meta = onnx_decoder.metadata_props.add()
+        meta.key, meta.value = str(k), str(v)
+    onnx.checker.check_model(onnx_decoder)
+    onnx.helper.printable_graph(onnx_decoder.graph)
+    onnx.save(onnx_decoder, decoder_outpath)
+    print_input_output_info(onnx_decoder, "onnx_decoder")
+    print('\t\tExport onnx_decoder, done! see {}'.format(
+        decoder_outpath))
+
+    print("\tStage-3.3: check onnx_decoder and torch_decoder")
+    torch_score = decoder(
+        hyps, encoder_out)
+    ort_session = onnxruntime.InferenceSession(decoder_outpath)
+    input_names = [node.name for node in onnx_decoder.graph.input]
+    ort_inputs = {
+        'hyps': to_numpy(hyps),
+        'encoder_out': to_numpy(encoder_out),
+    }
+    for k in list(ort_inputs):
+        if k not in input_names:
+            ort_inputs.pop(k)
+    onnx_output = ort_session.run(None, ort_inputs)
+
+    np.testing.assert_allclose(to_numpy(torch_score), onnx_output[0],
+                               rtol=1e-03, atol=1e-05)
+    print("\t\tCheck onnx_decoder, pass!")
 
 def main():
     torch.manual_seed(777)
@@ -576,6 +646,7 @@ def main():
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
     model = init_model(configs)
+
     load_checkpoint(model, args.checkpoint)
     model.eval()
     print(model)
@@ -620,7 +691,7 @@ def main():
         export_encoder(model, arguments)
     export_ctc(model, arguments)
     export_decoder(model, arguments)
-
+    export_decoder_single_uni(model, arguments)
 
 if __name__ == '__main__':
     main()

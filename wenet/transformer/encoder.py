@@ -241,10 +241,6 @@ class BaseEncoder(torch.nn.Module):
         else:
             next_cache_start = max(attention_key_size - required_cache_size, 0)
 
-        # convert to a constant so the input 'required_cache_size' will be eliminated and the graph will be simplified
-        if type(next_cache_start) == torch.Tensor:
-            next_cache_start = next_cache_start.detach().cpu().item()
-
         r_att_cache = []
         r_cnn_cache = []
         for i, layer in enumerate(self.encoders):

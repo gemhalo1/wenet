@@ -122,14 +122,20 @@ class TransformerDecoder(torch.nn.Module):
         """
         tgt = ys_in_pad
         maxlen = tgt.size(1)
-        # tgt_mask: (B, 1, L)
-        tgt_mask = ~make_pad_mask(ys_in_lens, maxlen).unsqueeze(1)
-        tgt_mask = tgt_mask.to(tgt.device)
-        # m: (1, L, L)
-        m = subsequent_mask(tgt_mask.size(-1),
-                            device=tgt_mask.device).unsqueeze(0)
-        # tgt_mask: (B, L, L)
-        tgt_mask = tgt_mask & m
+
+        if ys_in_lens is not None:
+            # tgt_mask: (B, 1, L)
+            tgt_mask = ~make_pad_mask(ys_in_lens, maxlen).unsqueeze(1)
+            tgt_mask = tgt_mask.to(tgt.device)
+            # m: (1, L, L)
+            m = subsequent_mask(tgt_mask.size(-1),
+                                device=tgt_mask.device).unsqueeze(0)
+            # tgt_mask: (B, L, L)
+            tgt_mask = tgt_mask & m
+        else:
+            tgt_mask = torch.ones((0, 0, 0),
+                                  dtype=torch.bool,
+                                  device=ys_in_pad.device)
         x, _ = self.embed(tgt)
         for layer in self.decoders:
             x, tgt_mask, memory, memory_mask = layer(x, tgt_mask, memory,
