@@ -149,14 +149,6 @@ void MnnAsrModel::Read(const std::string& model_dir) {
 
   // 1. Load sessions
   try {
-#ifdef _MSC_VER
-    encoder_session_ = std::make_shared<Ort::Session>(
-        env_, ToWString(encoder_onnx_path).c_str(), session_options_);
-    rescore_session_ = std::make_shared<Ort::Session>(
-        env_, ToWString(rescore_onnx_path).c_str(), session_options_);
-    ctc_session_ = std::make_shared<Ort::Session>(
-        env_, ToWString(ctc_onnx_path).c_str(), session_options_);
-#else
     encoder_interpreter_.reset(MNN::Interpreter::createFromFile(encoder_mnn_path.c_str()));
     encoder_session_ = std::make_shared<MnnSession>(encoder_interpreter_, scheduleConfig);
 
@@ -165,7 +157,6 @@ void MnnAsrModel::Read(const std::string& model_dir) {
     
     ctc_interpreter_.reset(MNN::Interpreter::createFromFile(ctc_mnn_path.c_str()));
     ctc_session_ = std::make_shared<MnnSession>(ctc_interpreter_, scheduleConfig);
-#endif
   } catch (std::exception const& e) {
     LOG(ERROR) << "error when load onnx model: " << e.what();
     exit(0);
@@ -388,6 +379,7 @@ void MnnAsrModel::ForwardEncoderFunc(
       }
     }
   }
+
   for(int i = real_chunk_size; i < chunk_size_; i++) {
     att_mask[required_cache_size + i] = 0;
   }

@@ -33,7 +33,6 @@
 #include "decoder/torch_asr_model.h"
 #endif
 #include "frontend/feature_pipeline.h"
-#include "mnn_asr_model.h"
 #include "post_processor/post_processor.h"
 #include "utils/flags.h"
 #include "utils/string.h"

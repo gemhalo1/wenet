@@ -691,7 +691,7 @@ def main():
         export_encoder(model, arguments)
     export_ctc(model, arguments)
     export_decoder(model, arguments)
-    export_decoder_single_uni(model, arguments)
+    # export_decoder_single_uni(model, arguments)
 
 if __name__ == '__main__':
     main()

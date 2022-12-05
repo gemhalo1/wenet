@@ -50,7 +50,7 @@ def compile_onnx_model(model_path, target, override_dynamic_inputs=None, use_ndk
 
 local_cpu_target = tvm.target.Target(target="llvm", host="llvm")
 
-encoder_lib = compile_onnx_model('/home/gem/development/learn/wenet_stream_model_0830/model_16_4/a.onnx', # '/home/gem/development/learn/wenet_stream_model_0830/no_offset/encoder.onnx',
+encoder_lib = compile_onnx_model('/home/gem/development/learn/wenet_stream_model_0830/fixed_16_4_no_offset/decoder.onnx', # '/home/gem/development/learn/wenet_stream_model_0830/no_offset/encoder.onnx',
                                  local_cpu_target,
                                  override_dynamic_inputs=None,
                                  use_ndk=False

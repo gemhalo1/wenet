@@ -16,7 +16,7 @@ endif()
 if(ONNX)
   list(APPEND decoder_srcs onnx_asr_model.cc)
 endif()
-if(ONNX)
+if(MNN)
   list(APPEND decoder_srcs mnn_asr_model.cc)
 endif()
 
