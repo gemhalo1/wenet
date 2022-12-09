@@ -62,6 +62,10 @@ class OnnxAsrModel : public AsrModel {
   int cnn_module_kernel_ = 0;
   int head_ = 0;
 
+  int feature_size_ = 0;
+  int decoding_window_ = 0;
+  bool fixed_ = false;
+
   // sessions
   // NOTE(Mddct): The Env holds the logging state used by all other objects.
   //  One Env must be created before using any other Onnxruntime functionality.

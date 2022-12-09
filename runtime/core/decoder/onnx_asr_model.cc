@@ -15,7 +15,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 #include "decoder/onnx_asr_model.h"
 
 #include <algorithm>
@@ -112,6 +111,13 @@ void OnnxAsrModel::Read(const std::string& model_dir) {
   num_blocks_ =
       atoi(model_metadata.LookupCustomMetadataMap("num_blocks", allocator));
   head_ = atoi(model_metadata.LookupCustomMetadataMap("head", allocator));
+  feature_size_ =
+      atoi(model_metadata.LookupCustomMetadataMap("feature_size", allocator));
+  decoding_window_ = atoi(
+      model_metadata.LookupCustomMetadataMap("decoding_window", allocator));
+  fixed_ = std::string(model_metadata.LookupCustomMetadataMap(
+               "fixed", allocator)) == "True";
+
   cnn_module_kernel_ = atoi(
       model_metadata.LookupCustomMetadataMap("cnn_module_kernel", allocator));
   subsampling_rate_ = atoi(
@@ -154,6 +160,11 @@ OnnxAsrModel::OnnxAsrModel(const OnnxAsrModel& other) {
   encoder_output_size_ = other.encoder_output_size_;
   num_blocks_ = other.num_blocks_;
   head_ = other.head_;
+
+  decoding_window_ = other.decoding_window_;
+  feature_size_ = other.feature_size_;
+  fixed_ = other.fixed_;
+
   cnn_module_kernel_ = other.cnn_module_kernel_;
   right_context_ = other.right_context_;
   subsampling_rate_ = other.subsampling_rate_;
@@ -236,9 +247,24 @@ void OnnxAsrModel::ForwardEncoderFunc(
   for (size_t i = 0; i < chunk_feats.size(); ++i) {
     feats.insert(feats.end(), chunk_feats[i].begin(), chunk_feats[i].end());
   }
-  const int64_t feats_shape[3] = {1, num_frames, feature_dim};
+
+  //!!! modified by Huang Hairong
+  int fixed_input_frames = num_frames;
+  if (fixed_) {
+    fixed_input_frames = decoding_window_;
+    int filled_frames = fixed_input_frames - num_frames;
+    if (filled_frames > 0) {
+      std::vector<float> zeros(feature_size_, 0.0f);
+      while (filled_frames-- > 0) {
+        feats.insert(feats.end(), zeros.begin(), zeros.end());
+      }
+    }
+  }
+
+  const int64_t feats_shape[3] = {1, fixed_input_frames, feature_dim};
   Ort::Value feats_ort = Ort::Value::CreateTensor<float>(
       memory_info, feats.data(), feats.size(), feats_shape, 3);
+
   // offset
   int64_t offset_int64 = static_cast<int64_t>(offset_);
   Ort::Value offset_ort = Ort::Value::CreateTensor<int64_t>(
@@ -261,6 +287,16 @@ void OnnxAsrModel::ForwardEncoderFunc(
     att_mask_ort = Ort::Value::CreateTensor<bool>(
         memory_info, reinterpret_cast<bool*>(att_mask.data()), att_mask.size(),
         att_mask_shape, 3);
+  }
+
+  //!!!! modified by Huang Hairong
+  if (fixed_) {
+    // correctly set att_mask[] tails to zero, must take downsampling int
+    // consideration
+    int x = ((num_frames - 1) / 2 - 1) / 2; //size of the chunk after downsampling
+    for (size_t i = required_cache_size + x; i < att_mask.size(); i++) {
+      att_mask[i] = 0;
+    }
   }
 
   // 2. Encoder chunk forward
