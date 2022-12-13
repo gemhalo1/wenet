@@ -729,6 +729,51 @@ class ASRModel(torch.nn.Module):
         r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
         return decoder_out, r_decoder_out
 
+
+    @torch.jit.export
+    def forward_attention_decoder_manual(
+            self,
+            hyps: torch.Tensor,
+            r_hyps: torch.Tensor,
+            hyps_lens: torch.Tensor,
+            encoder_out: torch.Tensor,
+            reverse_weight: float = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ Export interface for c++ call, forward decoder with multiple
+            hypothesis from ctc prefix beam search and one encoder output
+        Args:
+            hyps (torch.Tensor): hyps from ctc prefix beam search, already
+                pad sos at the begining
+            hyps_lens (torch.Tensor): length of each hyp in hyps
+            encoder_out (torch.Tensor): corresponding encoder output
+            r_hyps (torch.Tensor): hyps from ctc prefix beam search, already
+                pad eos at the begining which is used fo right to left decoder
+            reverse_weight: used for verfing whether used right to left decoder,
+            > 0 will use.
+
+        Returns:
+            torch.Tensor: decoder output
+        """
+        assert encoder_out.size(0) == 1
+        num_hyps = hyps.size(0)
+        assert hyps_lens.size(0) == num_hyps
+        encoder_out = encoder_out.repeat(num_hyps, 1, 1)
+        encoder_mask = torch.ones((0, 0, 0),
+                                  dtype=torch.bool,
+                                  device=encoder_out.device)
+
+        decoder_out, r_decoder_out, _ = self.decoder(
+            encoder_out, encoder_mask, hyps, hyps_lens, r_hyps,
+            reverse_weight)  # (num_hyps, max_hyps_len, vocab_size)
+        decoder_out = torch.nn.functional.log_softmax(decoder_out, dim=-1)
+
+        # right to left decoder may be not used during decoding process,
+        # which depends on reverse_weight param.
+        # r_dccoder_out will be 0.0, if reverse_weight is 0.0
+        r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
+        return decoder_out, r_decoder_out
+
+
     @torch.jit.export
     def forward_attention_decoder_single_uni(
             self,

@@ -26,6 +26,8 @@
 
 namespace json = boost::json;
 
+//extern void write_data(const char* filename, void* data, size_t length);
+
 namespace wenet {
 
 
@@ -142,7 +144,7 @@ json::value read_json( std::istream& is, json::error_code& ec )
 
 void MnnAsrModel::Read(const std::string& model_dir) {
   std::string encoder_mnn_path = model_dir + "/encoder.mnn";
-  std::string rescore_mnn_path = model_dir + "/decoder_s.mnn";
+  std::string rescore_mnn_path = model_dir + "/decoder.mnn";
   std::string ctc_mnn_path = model_dir + "/ctc.mnn";
   std::string meta_mnn_path = model_dir + "/meta.json";
   std::string pos_mnn_path = model_dir + "/pos_emb.bin";
@@ -248,7 +250,7 @@ MnnAsrModel::MnnAsrModel(const MnnAsrModel& other) {
 
   {
     auto t = encoder_session_->getSessionInput("chunk");
-    auto x =  t->getDimensionType();
+
     local_feats_tensor_ =
         std::make_unique<MNN::Tensor>(t, t->getDimensionType());
 
@@ -259,6 +261,16 @@ MnnAsrModel::MnnAsrModel(const MnnAsrModel& other) {
     t = encoder_session_->getSessionInput("pos_emb");
     local_pos_emb_tensor_ =
         std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+
+    t = encoder_session_->getSessionInput("cnn_cache");
+    local_cnn_cache_tensor_ =
+        std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+    std::fill(local_cnn_cache_tensor_->host<float>(), local_cnn_cache_tensor_->host<float>() + local_cnn_cache_tensor_->elementSize(), 0.0f);
+
+    t = encoder_session_->getSessionInput("att_cache");
+    local_att_cache_tensor_ =
+        std::make_unique<MNN::Tensor>(t, t->getDimensionType());
+    std::fill(local_att_cache_tensor_->host<float>(), local_att_cache_tensor_->host<float>() + local_att_cache_tensor_->elementSize(), 0.0f);
   }
 
   pos_emb_table_ = other.pos_emb_table_;
@@ -280,46 +292,14 @@ std::shared_ptr<AsrModel> MnnAsrModel::Copy() const {
 }
 
 void MnnAsrModel::Reset() {
-  offset_ = 0;
+  offset_ = chunk_size_ * num_left_chunks_;
   //  encoder_outs_.clear();
   cached_feature_.clear();
+  encoder_outs_.clear();
 
   // Reset att_cache
-  if (num_left_chunks_ > 0) {
-    int required_cache_size = chunk_size_ * num_left_chunks_;
-
-    offset_ = required_cache_size;
-
-    std::vector<int> att_cache_shape  = {num_blocks_, head_, required_cache_size,
-                                        encoder_output_size_ / head_ * 2};
-
-    MNN::Tensor* t = encoder_session_->getSessionInput("att_cache");
-    encoder_interpreter_->resizeTensor(t, att_cache_shape);
-
-    //fill with 0.0f
-    auto* buffer = t->host<float>();
-    std::fill(buffer, buffer + t->elementSize(), 0.0f);
-  } else {
-    std::vector<int> att_cache_shape = {num_blocks_, head_, 0,
-                                        encoder_output_size_ / head_ * 2};
-
-    MNN::Tensor* t = encoder_session_->getSessionInput("att_cache");
-    encoder_interpreter_->resizeTensor(t, att_cache_shape);
-    auto* buffer = t->host<float>();
-    std::fill(buffer, buffer + t->elementSize(), 0.0f);
-  }
-
-  // Reset cnn_cache
-  {
-    std::vector<int> cnn_cache_shape = {num_blocks_, 1, encoder_output_size_,
-                                        cnn_module_kernel_ - 1};
-
-    MNN::Tensor* t = encoder_session_->getSessionInput("cnn_cache");
-    encoder_interpreter_->resizeTensor(t, cnn_cache_shape);
-
-    // fill with 0.0f
-    auto* buffer = t->host<float>();
-    std::fill(buffer, buffer + t->elementSize(), 0.0f);
+  if(num_left_chunks_ <= 0) {
+    LOG(FATAL) << "invalid num_left_chunks_ value: " << num_left_chunks_;
   }
 }
 
@@ -370,7 +350,8 @@ void MnnAsrModel::ForwardEncoderFunc(
   int required_cache_size = chunk_size_ * num_left_chunks_;
 
   // att_mask
-  std::vector<int32_t> att_mask(required_cache_size + chunk_size_);
+  std::vector<int32_t> att_mask(required_cache_size + chunk_size_, 1);
+  //for MNN we always use num_left_chunks_ > 0
   if (num_left_chunks_ > 0) {
     int chunk_idx = offset_ / chunk_size_ - num_left_chunks_;
     if (chunk_idx < num_left_chunks_) {
@@ -380,9 +361,11 @@ void MnnAsrModel::ForwardEncoderFunc(
     }
   }
 
-  for(int i = real_chunk_size; i < chunk_size_; i++) {
-    att_mask[required_cache_size + i] = 0;
+  int real_chunks = ((num_frames - 1) / 2 - 1) / 2; //size of the chunk after downsampling
+  for (size_t i = required_cache_size + real_chunks; i < att_mask.size(); i++) {
+    att_mask[i] = 0;
   }
+
   std::copy(att_mask.begin(), att_mask.end(), local_att_mask_tensor_->host<int32_t>());
   MNN::Tensor* att_mask_tensor = encoder_session_->getSessionInput("att_mask");
   att_mask_tensor->copyFromHostTensor(local_att_mask_tensor_.get());
@@ -391,11 +374,27 @@ void MnnAsrModel::ForwardEncoderFunc(
   MNN::Tensor* pos_emb_tensor = encoder_session_->getSessionInput("pos_emb");
   {
     int emb_start = (offset_ - required_cache_size) * encoder_output_size_;
-    int emb_end = emb_start + (required_cache_size + chunk_size_) * encoder_output_size_;
+    int emb_end = (offset_ + chunk_size_) * encoder_output_size_;
 
     std::copy(pos_emb_table_->begin() + emb_start,  pos_emb_table_->begin() + emb_end, local_pos_emb_tensor_->host<float>());
     pos_emb_tensor->copyFromHostTensor(local_pos_emb_tensor_.get());
   }
+
+  MNN::Tensor* cnn_cache_tensor = encoder_session_->getSessionInput("cnn_cache");
+  cnn_cache_tensor->copyFromHostTensor(local_cnn_cache_tensor_.get());
+
+  MNN::Tensor* att_cache_tensor = encoder_session_->getSessionInput("att_cache");
+  att_cache_tensor->copyFromHostTensor(local_att_cache_tensor_.get());
+
+
+  //  if(offset_ == required_cache_size + 8) {
+  //    write_data("/tmp/mnn_chunk.bin", local_feats_tensor_->host<float>(), local_feats_tensor_->elementSize() * sizeof(float));
+  //    write_data("/tmp/mnn_pos_emb.bin", local_pos_emb_tensor_->host<float>(), local_pos_emb_tensor_->elementSize() * sizeof(float));
+  //    write_data("/tmp/mnn_att_mask.bin", local_att_mask_tensor_->host<int32_t>(), local_att_mask_tensor_->elementSize() * sizeof(int32_t));
+  //    write_data("/tmp/mnn_cnn_cache.bin", local_cnn_cache_tensor_->host<float>(), local_cnn_cache_tensor_->elementSize() * sizeof(float));
+  //    write_data("/tmp/mnn_att_cache.bin", local_att_cache_tensor_->host<float>(), local_att_cache_tensor_->elementSize() * sizeof(float));
+  //  }
+
 
   // 2. Encoder chunk forward
 
@@ -405,12 +404,14 @@ void MnnAsrModel::ForwardEncoderFunc(
   MNN::Tensor* r_att_cache_tensor = encoder_session_->getSessionOutput("r_att_cache");
   MNN::Tensor* r_cnn_cache_tensor = encoder_session_->getSessionOutput("r_cnn_cache");
 
-  r_att_cache_tensor->copyToHostTensor(encoder_session_->getSessionInput("att_cache"));
-  r_cnn_cache_tensor->copyToHostTensor(encoder_session_->getSessionInput("cnn_cache"));
+  r_att_cache_tensor->copyToHostTensor(local_att_cache_tensor_.get());
+  r_cnn_cache_tensor->copyToHostTensor(local_cnn_cache_tensor_.get());
 
-  std::vector<int> output_shape = output_tensor->shape();
+  encoder_outs_.emplace_back(
+      output_tensor->host<float>(),
+      output_tensor->host<float>() + real_chunks * encoder_output_size_);
 
-  offset_ += (int)output_shape[1];
+  offset_ += real_chunks;
 
   /////////////////////////////////////////////
   MNN::Tensor* hidden_tensor = ctc_session_->getSessionInput("hidden");
@@ -437,21 +438,41 @@ float MnnAsrModel::ComputeAttentionScore(const float* prob,
                                          const std::vector<int>& hyp, int eos,
                                          int decode_out_len) {
   float score = 0.0f;
-#if 0
+
   for (size_t j = 0; j < hyp.size(); ++j) {
     score += *(prob + j * decode_out_len + hyp[j]);
   }
+
   score += *(prob + hyp.size() * decode_out_len + eos);
-#endif
+
   return score;
+}
+
+static void pad_hyps(int* hyps_pad, const std::vector<std::vector<int>>& hyps, int sos, int max_hyps_len, bool reverse=false) {
+  size_t num_hyps = hyps.size();
+  int* p = hyps_pad;
+
+  for (size_t i = 0; i < num_hyps; ++i) {
+    const std::vector<int>& hyp = hyps[i];
+    *p++ = sos;
+    size_t j = 0;
+
+    for (; j < hyp.size(); ++j) {
+      *p++ = reverse ? hyp[hyp.size() - j - 1] : hyp[j];
+    }
+
+    if (j == max_hyps_len - 1) {
+      continue;
+    }
+    for (; j < max_hyps_len - 1; ++j) {
+      *p++ = 0;
+    }
+  }
 }
 
 void MnnAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
                                      float reverse_weight,
                                      std::vector<float>* rescoring_score) {
-#if 0
-  Ort::MemoryInfo memory_info =
-      Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
   CHECK(rescoring_score != nullptr);
   int num_hyps = hyps.size();
   rescoring_score->resize(num_hyps, 0.0f);
@@ -464,72 +485,83 @@ void MnnAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
     return;
   }
 
-  std::vector<int64_t> hyps_lens;
+  std::vector<int> hyps_lens;
   int max_hyps_len = 0;
   for (size_t i = 0; i < num_hyps; ++i) {
     int length = hyps[i].size() + 1;
     max_hyps_len = std::max(length, max_hyps_len);
-    hyps_lens.emplace_back(static_cast<int64_t>(length));
+    hyps_lens.emplace_back(length);
   }
 
-  std::vector<float> rescore_input;
-  int encoder_len = 0;
-  for (int i = 0; i < encoder_outs_.size(); i++) {
-    float* encoder_outs_data = encoder_outs_[i].GetTensorMutableData<float>();
-    auto type_info = encoder_outs_[i].GetTensorTypeAndShapeInfo();
-    for (int j = 0; j < type_info.GetElementCount(); j++) {
-      rescore_input.emplace_back(encoder_outs_data[j]);
-    }
-    encoder_len += type_info.GetShape()[1];
+  size_t encoder_data_len = 0;
+  for (const auto & encoder_out : encoder_outs_) {
+    encoder_data_len += encoder_out.size();
   }
 
-  const int64_t decode_input_shape[] = {1, encoder_len, encoder_output_size_};
+//  printf("encoder_data_len = %ld\n", encoder_data_len / encoder_output_size_);
 
-  std::vector<int64_t> hyps_pad;
+  std::vector<int> real_encoder_out_shape = {1, (int)(encoder_data_len / encoder_output_size_), encoder_output_size_};
 
-  for (size_t i = 0; i < num_hyps; ++i) {
-    const std::vector<int>& hyp = hyps[i];
-    hyps_pad.emplace_back(sos_);
-    size_t j = 0;
-    for (; j < hyp.size(); ++j) {
-      hyps_pad.emplace_back(hyp[j]);
-    }
-    if (j == max_hyps_len - 1) {
-      continue;
-    }
-    for (; j < max_hyps_len - 1; ++j) {
-      hyps_pad.emplace_back(0);
-    }
+  rescore_session_->runSession();
+  MNN::Tensor* encoder_out_tensor = rescore_session_->getSessionInput("encoder_out");
+  rescore_session_->resizeTensor(encoder_out_tensor, real_encoder_out_shape);
+
+  std::vector<int> real_hyps_shape= {num_hyps, max_hyps_len};
+  MNN::Tensor* hyps_tensor = rescore_session_->getSessionInput("hyps");
+  rescore_session_->resizeTensor(hyps_tensor, real_hyps_shape);
+
+  MNN::Tensor* r_hyps_tensor = rescore_session_->getSessionInput("r_hyps");
+  rescore_session_->resizeTensor(r_hyps_tensor, real_hyps_shape);
+
+  std::vector<int> real_hyps_length_shape= {num_hyps};
+  MNN::Tensor* hyps_lens_tensor = rescore_session_->getSessionInput("hyps_lens");
+  rescore_session_->resizeTensor(hyps_lens_tensor, real_hyps_length_shape);
+
+  rescore_session_->resizeSession();
+
+  //encoder_out
+  auto local_encoder_out = std::make_unique<MNN::Tensor>(encoder_out_tensor, encoder_out_tensor->getDimensionType());
+  auto* local_encoder_out_data = local_encoder_out->host<float>();
+  size_t data_offset = 0;
+  for (auto & e : encoder_outs_) {
+    std::copy(e.begin(), e.end(), local_encoder_out_data + data_offset);
+    data_offset += e.size();
   }
+  encoder_out_tensor->copyFromHostTensor(local_encoder_out.get());
 
-  const int64_t hyps_pad_shape[] = {num_hyps, max_hyps_len};
+  //  write_data("/tmp/mnn_encoder_out.bin", local_encoder_out->host<float>(), local_encoder_out->elementSize() * sizeof(float));
 
-  const int64_t hyps_lens_shape[] = {num_hyps};
+  //hyps
+  auto local_hyps = std::make_unique<MNN::Tensor>(hyps_tensor, hyps_tensor->getDimensionType());
+  pad_hyps(local_hyps->host<int>(), hyps, sos_, max_hyps_len, false);
+  hyps_tensor->copyFromHostTensor(local_hyps.get());
+  //  write_data("/tmp/mnn_hyps.bin", local_hyps->host<int>(), local_hyps->elementSize() * sizeof(int));
 
-  Ort::Value decode_input_tensor_ = Ort::Value::CreateTensor<float>(
-      memory_info, rescore_input.data(), rescore_input.size(),
-      decode_input_shape, 3);
-  Ort::Value hyps_pad_tensor_ = Ort::Value::CreateTensor<int64_t>(
-      memory_info, hyps_pad.data(), hyps_pad.size(), hyps_pad_shape, 2);
-  Ort::Value hyps_lens_tensor_ = Ort::Value::CreateTensor<int64_t>(
-      memory_info, hyps_lens.data(), hyps_lens.size(), hyps_lens_shape, 1);
+  //r_hyps
+  auto local_r_hyps = std::make_unique<MNN::Tensor>(r_hyps_tensor, r_hyps_tensor->getDimensionType());
+  pad_hyps(local_r_hyps->host<int>(), hyps, sos_, max_hyps_len, true);
+  r_hyps_tensor->copyFromHostTensor(local_r_hyps.get());
+  //  write_data("/tmp/mnn_r_hyps.bin", local_r_hyps->host<int>(), local_r_hyps->elementSize() * sizeof(int));
 
-  std::vector<Ort::Value> rescore_inputs;
+  //hyps_lens
+  auto local_hyps_lens = std::make_unique<MNN::Tensor>(hyps_lens_tensor, hyps_lens_tensor->getDimensionType());
+  std::copy(hyps_lens.begin(), hyps_lens.end(), local_hyps_lens->host<int>());
+  hyps_lens_tensor->copyFromHostTensor(local_hyps_lens.get());
 
-  rescore_inputs.emplace_back(std::move(hyps_pad_tensor_));
-  rescore_inputs.emplace_back(std::move(hyps_lens_tensor_));
-  rescore_inputs.emplace_back(std::move(decode_input_tensor_));
+  //  write_data("/tmp/mnn_hyps_lens.bin", hyps_lens.data(), hyps_lens.size() * sizeof(float));
+  rescore_session_->runSession();
 
-  std::vector<Ort::Value> rescore_outputs = rescore_session_->Run(
-      Ort::RunOptions{nullptr}, rescore_in_names_.data(), rescore_inputs.data(),
-      rescore_inputs.size(), rescore_out_names_.data(),
-      rescore_out_names_.size());
+  MNN::Tensor* score_tensor = rescore_session_->getSessionOutput("score");
+  auto decoder_outs_data = score_tensor->host<float>();
+  auto score_shape = score_tensor->shape();
 
-  float* decoder_outs_data = rescore_outputs[0].GetTensorMutableData<float>();
-  float* r_decoder_outs_data = rescore_outputs[1].GetTensorMutableData<float>();
+  int decode_out_len = score_shape[2];
 
-  auto type_info = rescore_outputs[0].GetTensorTypeAndShapeInfo();
-  int decode_out_len = type_info.GetShape()[2];
+  MNN::Tensor* r_score_tensor = rescore_session_->getSessionOutput("r_score");
+  auto r_decoder_outs_data = r_score_tensor->host<float>();
+
+  //  write_data("/tmp/mnn_score.bin", decoder_outs_data, score_tensor->elementSize() * sizeof(float));
+  //  write_data("/tmp/mnn_r_score.bin", r_decoder_outs_data, r_score_tensor->elementSize() * sizeof(float));
 
   for (size_t i = 0; i < num_hyps; ++i) {
     const std::vector<int>& hyp = hyps[i];
@@ -552,7 +584,6 @@ void MnnAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
     (*rescoring_score)[i] =
         score * (1 - reverse_weight) + r_score * reverse_weight;
   }
-#endif
 }
 
 }  // namespace wenet

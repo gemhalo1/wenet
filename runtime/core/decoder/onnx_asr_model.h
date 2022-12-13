@@ -66,6 +66,9 @@ class OnnxAsrModel : public AsrModel {
   int decoding_window_ = 0;
   bool fixed_ = false;
 
+  //the model has no "offset" and "required_cache_size" input, and has "pos_emb" input
+  bool no_offset_ = false;
+
   // sessions
   // NOTE(Mddct): The Env holds the logging state used by all other objects.
   //  One Env must be created before using any other Onnxruntime functionality.
@@ -74,6 +77,8 @@ class OnnxAsrModel : public AsrModel {
   std::shared_ptr<Ort::Session> encoder_session_ = nullptr;
   std::shared_ptr<Ort::Session> rescore_session_ = nullptr;
   std::shared_ptr<Ort::Session> ctc_session_ = nullptr;
+
+  std::shared_ptr<std::vector<float>> pos_emb_table_ = nullptr;
 
   // node names
   std::vector<const char*> encoder_in_names_, encoder_out_names_;

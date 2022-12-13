@@ -23,6 +23,15 @@
 
 #include "utils/string.h"
 
+//void write_data(const char* filename, void* data, size_t length) {
+//  FILE* fp = fopen(filename, "wb");
+//
+//  if(fp) {
+//    fwrite(data, length, 1, fp);
+//    fclose(fp);
+//  }
+//}
+
 namespace wenet {
 
 Ort::Env OnnxAsrModel::env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "");
@@ -40,6 +49,7 @@ void OnnxAsrModel::GetInputOutputInfo(
   // Input info
   int num_nodes = session->GetInputCount();
   in_names->resize(num_nodes);
+
   for (int i = 0; i < num_nodes; ++i) {
     char* name = session->GetInputName(i, allocator);
     Ort::TypeInfo type_info = session->GetInputTypeInfo(i);
@@ -55,6 +65,7 @@ void OnnxAsrModel::GetInputOutputInfo(
               << " dims=" << shape.str();
     (*in_names)[i] = name;
   }
+
   // Output info
   num_nodes = session->GetOutputCount();
   out_names->resize(num_nodes);
@@ -149,6 +160,44 @@ void OnnxAsrModel::Read(const std::string& model_dir) {
   // 3. Read model nodes
   LOG(INFO) << "Onnx Encoder:";
   GetInputOutputInfo(encoder_session_, &encoder_in_names_, &encoder_out_names_);
+
+  //!!!! added by Huang Hairong
+  bool found_offset = false, found_required_cache_size = false, found_pos_emb = false;
+  for(const char* name : encoder_in_names_) {
+    if (!strcmp(name, "offset")) {
+      found_offset = true;
+    }
+    if (!strcmp(name, "required_cache_size")) {
+      found_required_cache_size = true;
+    }
+    if (!strcmp(name, "pos_emb")) {
+      found_pos_emb = true;
+    }
+  }
+  if( (found_offset && found_required_cache_size && !found_pos_emb)  ) {
+    //normal mode
+
+    LOG(INFO) << "normal encoder model";
+  } else if(!found_offset && !found_required_cache_size && found_pos_emb) {
+    //no-offset mode
+    no_offset_ = true;
+
+    std::string pos_emb_path = model_dir + "/pos_emb.bin";
+    std::ifstream posemb_stream(pos_emb_path, std::ios::binary | std::ios::in);
+    if (posemb_stream) {
+      posemb_stream.seekg(0, std::ios::end);
+      size_t length = posemb_stream.tellg();
+      pos_emb_table_ =
+          std::make_shared<std::vector<float>>(length / sizeof(float));
+      posemb_stream.seekg(0, std::ios::beg);
+      posemb_stream.read((char*)pos_emb_table_->data(), length);
+
+      LOG(INFO) << "\t>>>> no offset model: read " << pos_emb_table_->size() << " floats";
+    }
+  } else {
+    LOG(FATAL) << "Wrong model: offset, required_cache_size or pos_emb";
+  }
+
   LOG(INFO) << "Onnx CTC:";
   GetInputOutputInfo(ctc_session_, &ctc_in_names_, &ctc_out_names_);
   LOG(INFO) << "Onnx Rescore:";
@@ -164,6 +213,7 @@ OnnxAsrModel::OnnxAsrModel(const OnnxAsrModel& other) {
   decoding_window_ = other.decoding_window_;
   feature_size_ = other.feature_size_;
   fixed_ = other.fixed_;
+  pos_emb_table_ = other.pos_emb_table_;
 
   cnn_module_kernel_ = other.cnn_module_kernel_;
   right_context_ = other.right_context_;
@@ -267,12 +317,9 @@ void OnnxAsrModel::ForwardEncoderFunc(
 
   // offset
   int64_t offset_int64 = static_cast<int64_t>(offset_);
-  Ort::Value offset_ort = Ort::Value::CreateTensor<int64_t>(
-      memory_info, &offset_int64, 1, std::vector<int64_t>{}.data(), 0);
   // required_cache_size
   int64_t required_cache_size = chunk_size_ * num_left_chunks_;
-  Ort::Value required_cache_size_ort = Ort::Value::CreateTensor<int64_t>(
-      memory_info, &required_cache_size, 1, std::vector<int64_t>{}.data(), 0);
+
   // att_mask
   Ort::Value att_mask_ort{nullptr};
   std::vector<uint8_t> att_mask(required_cache_size + chunk_size_, 1);
@@ -293,8 +340,8 @@ void OnnxAsrModel::ForwardEncoderFunc(
   if (fixed_) {
     // correctly set att_mask[] tails to zero, must take downsampling int
     // consideration
-    int x = ((num_frames - 1) / 2 - 1) / 2; //size of the chunk after downsampling
-    for (size_t i = required_cache_size + x; i < att_mask.size(); i++) {
+    int real_chunks = ((num_frames - 1) / 2 - 1) / 2; //size of the chunk after downsampling
+    for (size_t i = required_cache_size + real_chunks; i < att_mask.size(); i++) {
       att_mask[i] = 0;
     }
   }
@@ -305,17 +352,41 @@ void OnnxAsrModel::ForwardEncoderFunc(
     if (!strcmp(name, "chunk")) {
       inputs.emplace_back(std::move(feats_ort));
     } else if (!strcmp(name, "offset")) {
+      // offset
+      Ort::Value offset_ort = Ort::Value::CreateTensor<int64_t>(
+          memory_info, &offset_int64, 1, std::vector<int64_t>{}.data(), 0);
       inputs.emplace_back(std::move(offset_ort));
+
     } else if (!strcmp(name, "required_cache_size")) {
+      Ort::Value required_cache_size_ort = Ort::Value::CreateTensor<int64_t>(
+          memory_info, &required_cache_size, 1, std::vector<int64_t>{}.data(), 0);
       inputs.emplace_back(std::move(required_cache_size_ort));
+    } else if (!strcmp(name, "pos_emb")) {
+      const int64_t pos_emb_shape[3] = {1, required_cache_size + chunk_size_, encoder_output_size_};
+      size_t pos_emb_size = (required_cache_size + chunk_size_) * encoder_output_size_;
+      Ort::Value pos_emb = Ort::Value::CreateTensor<float>(
+          memory_info, pos_emb_table_->data() + (offset_ - required_cache_size) * encoder_output_size_, pos_emb_size, pos_emb_shape, 3);
+      inputs.emplace_back(std::move(pos_emb));
     } else if (!strcmp(name, "att_cache")) {
       inputs.emplace_back(std::move(att_cache_ort_));
+
     } else if (!strcmp(name, "cnn_cache")) {
       inputs.emplace_back(std::move(cnn_cache_ort_));
     } else if (!strcmp(name, "att_mask")) {
       inputs.emplace_back(std::move(att_mask_ort));
     }
   }
+
+//  if(offset_ == required_cache_size + 8) {
+//    write_data("/tmp/onnx_chunk.bin", feats.data(),
+//               feats.size() * sizeof(float));
+//    write_data("/tmp/onnx_pos_emb.bin", pos_emb_table_->data() + (offset_ - required_cache_size) * encoder_output_size_,
+//               (required_cache_size + chunk_size_) * encoder_output_size_ * sizeof(float));
+//    write_data("/tmp/onnx_att_cache.bin", att_cache_.data(), att_cache_.size() * sizeof(float));
+//    write_data("/tmp/onnx_cnn_cache.bin", cnn_cache_.data(), cnn_cache_.size() * sizeof(float));
+//    write_data("/tmp/onnx_att_mask.bin", att_mask.data(), att_mask.size() * sizeof(uint8_t));
+//  }
+
 
   std::vector<Ort::Value> ort_outputs = encoder_session_->Run(
       Ort::RunOptions{nullptr}, encoder_in_names_.data(), inputs.data(),
@@ -431,7 +502,12 @@ void OnnxAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
   rescore_inputs.emplace_back(std::move(hyps_lens_tensor_));
   rescore_inputs.emplace_back(std::move(decode_input_tensor_));
 
-  std::vector<Ort::Value> rescore_outputs = rescore_session_->Run(
+//    write_data("/tmp/onnx_hyps.bin", hyps_pad.data(),
+//             hyps_pad.size() * sizeof(int64_t));
+//    write_data("/tmp/onnx_hyps_length.bin", hyps_lens.data(), hyps_lens.size() * sizeof(int64_t));
+//    write_data("/tmp/onnx_encoder_out.bin", rescore_input.data(), rescore_input.size() * sizeof(float));
+
+ std::vector<Ort::Value> rescore_outputs = rescore_session_->Run(
       Ort::RunOptions{nullptr}, rescore_in_names_.data(), rescore_inputs.data(),
       rescore_inputs.size(), rescore_out_names_.data(),
       rescore_out_names_.size());
@@ -439,8 +515,13 @@ void OnnxAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
   float* decoder_outs_data = rescore_outputs[0].GetTensorMutableData<float>();
   float* r_decoder_outs_data = rescore_outputs[1].GetTensorMutableData<float>();
 
+
   auto type_info = rescore_outputs[0].GetTensorTypeAndShapeInfo();
   int decode_out_len = type_info.GetShape()[2];
+
+
+//  write_data("/tmp/onnx_score.bin", decoder_outs_data,  (type_info.GetShape()[0] * type_info.GetShape()[1] * type_info.GetShape()[2]) * sizeof(float));
+//  write_data("/tmp/onnx_rscore.bin", r_decoder_outs_data,  (type_info.GetShape()[0] * type_info.GetShape()[1] * type_info.GetShape()[2]) * sizeof(float));
 
   for (size_t i = 0; i < num_hyps; ++i) {
     const std::vector<int>& hyp = hyps[i];

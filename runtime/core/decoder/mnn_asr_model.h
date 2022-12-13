@@ -100,6 +100,10 @@ class MnnAsrModel : public AsrModel {
   std::unique_ptr<MNN::Tensor> local_feats_tensor_;
   std::unique_ptr<MNN::Tensor> local_att_mask_tensor_;
   std::unique_ptr<MNN::Tensor> local_pos_emb_tensor_;
+  std::unique_ptr<MNN::Tensor> local_att_cache_tensor_;
+  std::unique_ptr<MNN::Tensor> local_cnn_cache_tensor_;
+
+  std::vector<std::vector<float>> encoder_outs_;
 
   // node names
   std::vector<const char*> encoder_in_names_, encoder_out_names_;
