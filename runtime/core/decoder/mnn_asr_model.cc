@@ -20,11 +20,9 @@
 #include <algorithm>
 #include <memory>
 #include <utility>
-#include "boost/json/src.hpp"
 
 #include "utils/string.h"
-
-namespace json = boost::json;
+#include "model_meta.h"
 
 //extern void write_data(const char* filename, void* data, size_t length);
 
@@ -123,23 +121,6 @@ void MnnAsrModel::GetInputOutputInfo(
               << " dims=" << shape.str();
     out_names->push_back(name.c_str());
   }
-
-}
-
-json::value read_json( std::istream& is, json::error_code& ec )
-{
-  json::stream_parser p;
-  std::string line;
-  while( std::getline( is, line ) )
-  {
-    p.write( line, ec );
-    if( ec )
-      return nullptr;
-  }
-  p.finish( ec );
-  if( ec )
-    return nullptr;
-  return p.release();
 }
 
 void MnnAsrModel::Read(const std::string& model_dir) {
@@ -165,30 +146,19 @@ void MnnAsrModel::Read(const std::string& model_dir) {
   }
 
   // 2. Read metadata
-  std::ifstream meta_stream;
-  meta_stream.open(meta_mnn_path.c_str(), std::ios::in);
-  if(meta_stream.is_open()) {
-    json::error_code ec;
-    json::value value = read_json(meta_stream, ec);
-
-    if(value.is_object()) {
-      json::object obj = value.as_object();
-
-#define CONVERT_INT_FIELD(f) atoi(obj[f].as_string().c_str())
-      encoder_output_size_ = CONVERT_INT_FIELD("output_size");
-      num_blocks_ = CONVERT_INT_FIELD("num_blocks");
-      head_ = CONVERT_INT_FIELD("head");
-      cnn_module_kernel_ = CONVERT_INT_FIELD("cnn_module_kernel");
-      subsampling_rate_ = CONVERT_INT_FIELD("subsampling_rate");
-      right_context_ = CONVERT_INT_FIELD("right_context");
-      sos_ = CONVERT_INT_FIELD("sos_symbol");
-      eos_ = CONVERT_INT_FIELD("eos_symbol");
-      is_bidirectional_decoder_ = CONVERT_INT_FIELD("is_bidirectional_decoder");
-      chunk_size_ = CONVERT_INT_FIELD("chunk_size");
-      num_left_chunks_ = CONVERT_INT_FIELD("left_chunks");
-      deocding_window_ = CONVERT_INT_FIELD("decoding_window");
-    }
-  }
+  ModelMetadata meta = ModelMetadata::readJsonFile(meta_mnn_path.c_str());
+  encoder_output_size_ = meta.encoder_output_size_;
+  num_blocks_ = meta.num_blocks_;
+  head_ = meta.head_;
+  cnn_module_kernel_ = meta.cnn_module_kernel_;
+  subsampling_rate_ = meta.subsampling_rate_;
+  right_context_ = meta.right_context_;
+  sos_ = meta.sos_;
+  eos_ = meta.eos_;
+  is_bidirectional_decoder_ = meta.is_bidirectional_decoder_;
+  chunk_size_ = meta.chunk_size_;
+  num_left_chunks_ = meta.num_left_chunks_;
+  deocding_window_ = meta.decoding_window_;
 
   // 3. Read positional embedding data
   std::ifstream posemb_stream(pos_mnn_path, std::ios::binary | std::ios::in);

@@ -17,7 +17,7 @@ if(ONNX)
   list(APPEND decoder_srcs onnx_asr_model.cc)
 endif()
 if(MNN)
-  list(APPEND decoder_srcs mnn_asr_model.cc)
+  list(APPEND decoder_srcs mnn_asr_model.cc model_meta.cpp)
 endif()
 
 add_library(decoder STATIC ${decoder_srcs})
