@@ -44,7 +44,7 @@ android {
 
         ndkVersion '21.1.6352462'
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+            abiFilters 'armeabi-v7a', 'arm64-v8a' //, 'x86', 'x86_64'
         }
     }
 
@@ -57,7 +57,7 @@ android {
     }
     externalNativeBuild {
         cmake {
-            path "src/main/cpp/CMakeLists.txt"
+//            path "src/main/cpp/CMakeLists.txt"
         }
     }
     compileOptions {
@@ -75,11 +75,11 @@ dependencies {
     androidTestImplementation 'androidx.test.ext:junit:1.1.2'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.3.0'
 
-    implementation 'org.pytorch:pytorch_android:1.10.0'
-    extractForNativeBuild 'org.pytorch:pytorch_android:1.10.0'
+//    implementation 'org.pytorch:pytorch_android:1.10.0'
+//    extractForNativeBuild 'org.pytorch:pytorch_android:1.10.0'
 
-    implementation 'com.github.pengzhendong:wenet-openfst-android:1.0.2'
-    extractForNativeBuild 'com.github.pengzhendong:wenet-openfst-android:1.0.2'
+//    implementation 'com.github.pengzhendong:wenet-openfst-android:1.0.2'
+//    extractForNativeBuild 'com.github.pengzhendong:wenet-openfst-android:1.0.2'
 }
 
 task extractAARForNativeBuild {

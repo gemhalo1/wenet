@@ -1,0 +1,23 @@
+{
+    "output_dir": "model_8_4_fix_no_off",
+    "batch": "1",
+    "chunk_size": "8",
+    "left_chunks": "4",
+    "reverse_weight": "0.3",
+    "output_size": "256",
+    "num_blocks": "12",
+    "cnn_module_kernel": "8",
+    "head": "4",
+    "feature_size": "80",
+    "vocab_size": "6339",
+    "decoding_window": "35",
+    "encoder": "conformer",
+    "decoder": "bitransformer",
+    "subsampling_rate": "4",
+    "right_context": "6",
+    "sos_symbol": "6338",
+    "eos_symbol": "6338",
+    "is_bidirectional_decoder": "1",
+    "fixed": "True",
+    "beam": "3"
+}
